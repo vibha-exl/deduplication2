@@ -5,7 +5,7 @@ Last Update: 22/09/2025"""
  
 import warnings 
 import os, sys
-import json 
+import json
 import re
 import numpy as np
 from datetime import datetime, timedelta
@@ -20,7 +20,7 @@ from pyspark.sql.types import (
     StringType, TimestampType, DateType, DoubleType,
     IntegerType, BooleanType
 )
-from prompts.timescales_prompt import system_prompt_refund_timescales , system_prompt_delivery_prompt , system_prompt_payment_prompt, system_prompt_cancellation_refund_timeline, refund_promise_prompt
+from prompts.timescales_prompt import system_prompt_refund_timescales, system_prompt_payment_prompt, refund_promise_prompt, call_closure_prompt
 import yaml
 from pyspark.sql import functions as F
 sys.path.append('../')
@@ -30,6 +30,8 @@ warnings.filterwarnings("ignore")
 
 main_config = yaml.safe_load(open('../main_config.yaml', 'r'))
 llama_8b = main_config['LLM']['llama']
+llama_70b = main_config['LLM']['llama_large']
+
 
 response_format = json.dumps({
     "type": "json_schema",
@@ -113,6 +115,47 @@ response_format_cancellation = json.dumps({
         }
     }
 })
+
+response_format_call_closure = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "call_closure_detection",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "call_end_type": {
+                    "type": "string",
+                    "enum": ["Proper Call Closure", "Call Transferred", "Call On Hold", "Call Abruptly Ended"]
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Short quote or summary from the end of the transcript supporting the decision"
+                }
+            },
+            "required": ["call_end_type", "evidence"],
+            "strict": True
+        }
+    }
+})
+
+response_format_refund_validation = json.dumps({
+    "type": "json_schema",
+    "json_schema": {
+        "name": "refund_validation_detection",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "Refund initiated": {"type": "string", "enum": ["True", "False"]},
+                "Refund initiated evidence": {"type": "string"},
+                "Refund reason": {"type": "string"},
+                "Refund Timeline": {"type": "string", "enum": ["True", "False"]}
+            },
+            "required": ["Refund initiated", "Refund initiated evidence", "Refund reason", "Refund Timeline"],
+            "strict": True
+        }
+    }
+})
+
 
 
 def group(df,logger):
@@ -274,6 +317,8 @@ def timescales_process(df_process, df1_process, logger):
         display(spark.createDataFrame([{"df_filtered": df_filtered.count()}]))
         display(spark.createDataFrame([{"df_rest": df_rest.count()}]))
 
+
+        logger.info(f"num_calls_to_llm: {df_filtered.select('callid').distinct().count()}")
         result_df = df_filtered.withColumn("result", expr(f"ai_query('{llama_8b}', request => concat({system_prompt_timescales_json}, transcript, '\nCall date:\n', call_date), responseFormat => '{response_format}')"))
 
         response_schema = StructType([
@@ -313,7 +358,18 @@ def timescales_process(df_process, df1_process, logger):
             when(col("Level_2").isNull(), lit("")).otherwise(col("refund_timeline_text"))
         )
 
-
+        #check for weekend timeline:
+        logger.info(f"checking weekend timeline for refund cases.")
+        df_flagged = df_final.filter((col("score") == 0) | (col("score") == 1))
+        df_not_flagged = df_final.filter(~((col("score") == 0) | (col("score") == 1)))
+        # Only process flagged rows through the date-feature function
+        df_flagged = add_refund_expected_date_features(df_flagged)
+        # Set score to 10 if provided_correct_timeline_refund is True
+        df_flagged = df_flagged.withColumn(
+            "score",
+            when(col("provided_correct_timeline_refund") == True, lit(10)).otherwise(col("score"))
+        )
+        df_final = df_flagged.unionByName(df_not_flagged, allowMissingColumns=True)
 
         # Add required columns to df_rest with NA (None) and score=10
         df_rest_aug = df_rest.withColumn("refund_or_adjustment_made", lit(None).cast(StringType())) \
@@ -323,7 +379,7 @@ def timescales_process(df_process, df1_process, logger):
             .withColumn("score", lit(10).cast(IntegerType()))
 
         # Concatenate
-        df_concat = df_final.unionByName(df_rest_aug)
+        df_concat = df_final.unionByName(df_rest_aug, allowMissingColumns=True)
         df_concat = df_concat.withColumnRenamed("score", "score_refund")
         df_concat = df_concat.withColumn(
             "comments_refund",
@@ -375,7 +431,7 @@ def timescales_process(df_process, df1_process, logger):
 
 
 
-        pandas_df.to_excel('./intermediate_refund_timescale.xlsx')
+        pandas_df.to_excel('../temp/intermediate_refund_timescale.xlsx')
 
         df_concat = spark.createDataFrame(pandas_df)
         # df_comments = comments_results(df_concat, logger)
@@ -399,7 +455,7 @@ def timescales_process(df_process, df1_process, logger):
 
 def validate_refund_markdowns(dfspark):
     validation_prompt = json.dumps(refund_promise_prompt)
-    ai_query_expr =f"ai_query('{llama_8b}',request => concat('{validation_prompt}', '\n', transcript))"
+    ai_query_expr = f"ai_query('{llama_70b}', request => concat({validation_prompt}, '\\n', transcript), responseFormat => '{response_format_refund_validation}')"
     dfspark = dfspark.withColumn(
         "refund_val_LLM",
         expr(f"CASE WHEN score_refund IN (0, 1) THEN {ai_query_expr} ELSE NULL END")
@@ -423,32 +479,39 @@ def validate_refund_markdowns(dfspark):
         .withColumn("refund_initiated", col("refund_val_LLM_json.`Refund initiated`")) \
         .withColumn("refund_initiated_evidence", col("refund_val_LLM_json.`Refund initiated evidence`")) \
         .withColumn("refund_reason", col("refund_val_LLM_json.`Refund reason`"))\
-        .withColumn("refund_timeline", col("refund_val_LLM_json.`Refund Timeline`"))   
+        .withColumn("refund_timeline", col("refund_val_LLM_json.`Refund Timeline`")) 
 
+
+    # Log revalidation counts
+    false_refund_count = dfspark.filter(
+        (col("refund_val_LLM").isNotNull()) & (lower(col("refund_initiated")) == "false")
+    ).count()
+    logger.info(f"'Timescales-Module': Calls revalidated as no refund initiated: {false_refund_count}")
+    
 
     dfspark = dfspark.withColumn(
         "comments_refund",
-        when((col("refund_timeline") == "False"), lit("Advisor failed to inform customer the refund timeline") ).otherwise(col("comments_refund"))
+        when((lower(col("refund_timeline")) == "false"), lit("Advisor failed to inform customer the refund timeline") ).otherwise(col("comments_refund"))
     )
 
     dfspark = dfspark.withColumn(
         "score_refund",
-        when((col("refund_timeline") == "False"), 1 ).otherwise(col("score_refund"))
+        when((lower(col("refund_timeline")) == "false"), 1 ).otherwise(col("score_refund"))
     )
 
     dfspark = dfspark.withColumn(
         "results_refund",
-        when((col("refund_timeline") == "False"), lit("Compliant with Development") ).otherwise(col("results_refund"))
+        when((lower(col("refund_timeline")) == "false"), lit("Compliant with Development") ).otherwise(col("results_refund"))
     )
 
     dfspark = dfspark.withColumn(
         "score_refund",
-        when((col("refund_initiated") == "False") | (lower(col("refund_reason")).contains("cancel")), 10).otherwise(col("score_refund"))
+        when((lower(col("refund_initiated")) == "false") | (lower(col("refund_reason")).contains("cancel")), 10).otherwise(col("score_refund"))
     )
 
     dfspark = dfspark.withColumn(
         "comments_refund",
-        when((col("refund_initiated") == "False") | (lower(col("refund_reason")).contains("cancel")), lit("")).otherwise(col("comments_refund"))
+        when((lower(col("refund_initiated")) == "false") | (lower(col("refund_reason")).contains("cancel")), lit("")).otherwise(col("comments_refund"))
     )
 
     # cols_to_remove = ["refund_initiated", "refund_val_LLM_json", "refund_initiated_evidence", "refund_reason"]
@@ -561,6 +624,62 @@ def add_payment_expected_date_features(df):
     df = df.withColumn(
         "provided_correct_timeline",
         F.to_date("timeline_provided") == F.col("calculated_expected_date")
+    )
+
+    return df
+
+def add_refund_expected_date_features(df):
+    df = df.withColumn("call_date", F.to_date("createdate"))
+    df = df.withColumn("dow", F.date_format("createdate", "E"))
+    df = df.withColumn("hour", F.hour("createdate"))
+    df = df.withColumn("is_after_10pm", F.col("hour") >= 22)
+    df = df.withColumn(
+        "timeline_provided_refund",
+        parsed_payment_datee_udf(F.col("refund_timeline_text"), F.date_format(F.col("call_date"), "dd/MM/yyyy"))
+    )
+    df = df.withColumn(
+        "calculated_expected_date_refund",
+        F.when(
+            (F.col("dow") == "Mon") & (~F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 1)
+        ).when(
+            (F.col("dow") == "Mon") & (F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 2)
+        ).when(
+            (F.col("dow") == "Tue") & (~F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 1)
+        ).when(
+            (F.col("dow") == "Tue") & (F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 2)
+        ).when(
+            (F.col("dow") == "Wed") & (~F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 1)
+        ).when(
+            (F.col("dow") == "Wed") & (F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 2)
+        ).when(
+            (F.col("dow") == "Thu") & (~F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 1)
+        ).when(
+            (F.col("dow") == "Thu") & (F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 2)
+        ).when(
+            (F.col("dow") == "Fri") & (~F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 1)
+        ).when(
+            (F.col("dow") == "Fri") & (F.col("is_after_10pm")),
+            F.date_add(F.to_date("createdate"), 4)
+        ).when(
+            F.col("dow") == "Sat",
+            F.date_add(F.to_date("createdate"), 3)
+        ).when(
+            F.col("dow") == "Sun",
+            F.date_add(F.to_date("createdate"), 2)
+        )
+    )
+    df = df.withColumn(
+        "provided_correct_timeline_refund",
+        F.to_date("timeline_provided_refund") == F.col("calculated_expected_date_refund")
     )
 
     return df
@@ -859,7 +978,7 @@ def payment_process(df_process, df1_process, logger):
             df_rest_aug = df_rest_aug.withColumn(col_name, lit(None))
 
         df_concat = df_final.unionByName(df_rest_aug)
-        df_concat.toPandas().to_excel('./intermediate_payment_timescale.xlsx')
+        df_concat.toPandas().to_excel('../temp/intermediate_payment_timescale.xlsx')
         return df_concat
     except PySparkException as ex:
         if ex.getErrorClass() == "TABLE_OR_VIEW_NOT_FOUND":
@@ -1083,6 +1202,57 @@ req_level2 = ["Delivery Charge", "Collection Charge","INR - Courier Not Billed",
             "Make Payment", "Missing Payment"
             ]
 
+
+def validate_incomplete_transcripts(pandas_df, logger):
+    """Validate flagged calls for incomplete transcripts using call_closure_prompt via ai_query.
+    For calls where call_end_type != 'Proper Call Closure', override score/result/comment as BOD."""
+    try:
+        flagged_df = pandas_df[pandas_df['score_final_timescales'] != 10].copy()
+        if flagged_df.empty:
+            logger.info("'Timescales-Module': No flagged calls to validate for incomplete transcripts.")
+            return pandas_df
+
+        logger.info(f"'Timescales-Module': Validating {len(flagged_df)} flagged calls for incomplete transcripts.")
+
+        # Convert flagged rows to Spark for ai_query
+        flagged_spark = spark.createDataFrame(flagged_df)
+        call_closure_prompt_json = json.dumps(call_closure_prompt)
+
+        # Run ai_query with call_closure_prompt on transcript
+        flagged_spark = flagged_spark.withColumn(
+            "closure_validation_llm",
+            expr(f"ai_query('{llama_70b}', request => concat({call_closure_prompt_json}, '\\nTranscript:\\n', transcript), responseFormat => '{response_format_call_closure}')")
+        )
+
+        # Parse the response
+        closure_schema = StructType([
+            StructField("call_end_type", StringType(), True),
+            StructField("evidence", StringType(), True)
+        ])
+        flagged_spark = flagged_spark.withColumn(
+            "closure_parsed", from_json(col("closure_validation_llm"), closure_schema)
+        )
+        flagged_spark = flagged_spark.withColumn(
+            "call_end_type", col("closure_parsed.call_end_type")
+        ).drop("closure_parsed", "closure_validation_llm")
+
+        flagged_result = flagged_spark.toPandas()
+
+        # Get PKs of incomplete transcript calls
+        incomplete_pks = flagged_result[flagged_result['call_end_type'] != 'Proper Call Closure']['pk'].tolist()
+        logger.info(f"'Timescales-Module': Calls identified as incomplete transcripts (BOD): {len(incomplete_pks)}")
+
+        # Override score, result, comment for BOD calls
+        mask = pandas_df['pk'].isin(incomplete_pks)
+        pandas_df.loc[mask, 'score_final_timescales'] = 10
+        pandas_df.loc[mask, 'results_timescales'] = 'Compliant - Good Outcome'
+        pandas_df.loc[mask, 'comments_timescales'] = 'BOD due to incomplete/transfer transcripts'
+
+        return pandas_df
+    except Exception as e:
+        logger.error(f"'Timescales-Module': Error in validate_incomplete_transcripts: {e}")
+        return pandas_df
+
 def calculate_final_result(row):
     priority_dict = {
     "Compliant - Good Outcome": 3,  #Lowest
@@ -1129,40 +1299,15 @@ if __name__=="__main__":
         main_config = yaml.safe_load(open('../main_config.yaml', 'r'))
         llama_8b = main_config['LLM']['llama']
         catalog_config = yaml.safe_load(open('../catalog_config.yaml', 'r'))
-        # try:
-        #     formatted_date = dbutils.jobs.taskValues.get(taskKey="Pre-Modules-Run", key="sql_date")
-        # except Exception as e:
-        #     formatted_date = sys.argv[1]
-        #     if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(formatted_date)):
-        #         raise ValueError(f"formatted_date '{formatted_date}' is not in yyyy-mm-dd format")
-        #     logger.info(f"formatted_date: {formatted_date}")
-        formatted_date = "1999-01-01"
-        call_ids = [
-            "ed33a20d-20d8-40da-ad1d-a0b2a69dcad1",
-            "63581ae9-ba1f-4d67-85ea-5ecb8b7090d9",
-            "79ee4a85-e424-4b66-88b9-c7ca7e3f3cd2",
-            "0dbdd5b6-1c39-4731-84ec-0b13f53a08af",
-            "2f8850be-9542-428b-8044-8f6d53bad09b",
-            "456b5063-e9d0-4699-88a6-7966bf882080",
-            "61a1d404-e6da-47ab-b3ba-fe9809dabb39",
-            "adeb1020-6ba9-4556-b7b3-d2ea4c26b8e8",
-            "0d93a184-b01d-4720-ae39-a5edba352d0f",
-            "08022d37-d4e9-4c85-b39b-1af06b7a4023",
-            "33642d7c-3e61-4798-84d3-fd2ce05263e3",
-            "46ccb943-7388-4e35-a308-274879768dea",
-            "a62b41ea-fa66-4d65-b1af-29f2596778db",
-            "bcc6e504-48e7-47fe-b9c7-7f8c7de2dca5",
-            "f4089215-96c2-4821-ba37-5f1dd81aef15",
-            "cbc254a4-0afb-4599-9853-f9bbb81cf001"
-        ]
-        call_ids_str = ",".join([f"'{cid}'" for cid in call_ids])
-        INPUT_FILE_PATH = spark.sql(f"""
-            SELECT *
-            FROM contactcentre_prod.iaudit.filtered_input_data_v2_iaudit
-            WHERE callid IN ({call_ids_str})
-        """)
-        # INPUT_FILE_PATH = spark.table(catalog_config['output_table']['filtered_table']).filter(f"call_date = '{formatted_date}'")
-
+        try:
+            formatted_date = dbutils.jobs.taskValues.get(taskKey="Pre-Modules-Run", key="sql_date")
+        except Exception as e:
+            formatted_date = sys.argv[1]
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(formatted_date)):
+                raise ValueError(f"formatted_date '{formatted_date}' is not in yyyy-mm-dd format")
+            logger.info(f"formatted_date: {formatted_date}")
+        # formatted_date = "2026-03-27"
+        INPUT_FILE_PATH = spark.table(catalog_config['output_table']['filtered_table']).filter(f"call_date = '{formatted_date}'")
         df =  INPUT_FILE_PATH.toPandas()
         # df = df[df['callid'].isin([])]
 
@@ -1171,7 +1316,7 @@ if __name__=="__main__":
         # df = pd.read_excel(INPUT_FILE_PATH)
 
         grouped_df = group(df, logger)
-        print(grouped_df.columns)
+        logger.info(f"grouped_df shape: {grouped_df.shape}")
         spark_df = spark.createDataFrame(grouped_df)
         #sample_len = spark_df.count()//2
         # temp_df = spark_df.orderBy(col("callid").desc()).limit(20)
@@ -1203,12 +1348,14 @@ if __name__=="__main__":
         pandas_df = res.toPandas()
         
         pandas_df = pandas_df.apply(calculate_final_result, axis=1)
+        pandas_df = validate_incomplete_transcripts(pandas_df, logger)
         
         # for col in ['Score']:
         #     pandas_df[col] = pd.to_numeric(pandas_df[col], errors='coerce')
         pandas_df.columns = [col.replace(' ', '_') for col in pandas_df.columns]
         pandas_df['call_date'] = pd.to_datetime(formatted_date)
-        pandas_df.to_excel(f'./timescales_{formatted_date}.xlsx')
+        pandas_df.to_excel(f'../temp/timescales_{formatted_date}.xlsx')
+        
         final_res = spark.createDataFrame(pandas_df)
 
         final_res = final_res.withColumn("score_payment", col("score_payment").cast("double"))
